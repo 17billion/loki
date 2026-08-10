@@ -28,7 +28,7 @@ A metric query reduces log samples to a per-step numeric matrix. Regardless of m
 through the same stages:
 
 1. **Fan-out to sources.** The query is sent to every source that may hold matching data: ingesters
-   (including replicas), the chunk store, and — in the future — columnar data objects. Each source
+   (including replicas), the chunk store, and — experimentally — columnar data objects. Each source
    returns a stream of samples.
 2. **Cross-source merge + deduplication.** One merge layer combines the sources into a single
    stream and removes duplicate samples (the same log line served by more than one source).
@@ -245,14 +245,42 @@ order-independent accumulation:
 - The stream-first aggregator is order-independent; eligible queries produce results identical to the
   default path (enforced by differential tests).
 
-## Forward compatibility: columnar data objects
+## Columnar data objects (experimental)
 
 The strategic motivation for stream-first is columnar data objects, whose native on-disk layout is
 stream-first (samples laid out per stream). A data-object reader joins the pipeline as **just another
-stream-first source**: it presents each stream's samples in the required per-stream order and
-populates the same stream identity and sample hash as the other sources, so it merges and deduplicates
-against ingester and chunk-store data through the exact same seam. Timestamp-first, by contrast, would
-force a data object into a global time order its layout does not provide.
+stream-first source**: it stamps each sample with the stream's identity and feeds the merged stream to
+the order-independent stream-first evaluator, through the same seam as the ingester and chunk store. It
+does **not** take part in cross-source deduplication — the querier keeps the data-object window
+strictly older than the ingester and chunk-store reads, so a line is served by exactly one tier and
+there is nothing to reconcile (see the prototype below). Timestamp-first, by contrast, would force a
+data object into a global time order its layout does not provide.
+
+An experimental data-object sample reader (`querier.engine.dataobjects-reader-enabled`, alongside
+`stream-ordered-execution-enabled`) is wired into the v1 engine. It activates only for
+stream-first-eligible queries, and only over the
+data-object-available window (`engine.Config.ValidQueryRange()`, the same window the v2 engine uses).
+When active, a per-query `StoreCombiner` routes that window to the data-object source and everything
+else — the recent slice data objects lag, and anything older than availability — to the chunk store;
+the bounded ingester/store split keeps the window strictly older than the ingester query, so the tiers
+stay disjoint. The reader resolves sections from the metastore, projects only the columns the query
+needs (skipping the message column for `count`/`rate`), matches the shard-filtered streams, and applies
+the LogQL extractor. It emits samples in no particular order: the stream-first evaluator is
+order-independent, so the reader scans a data object's sections concurrently and forwards decoded rows
+in batches, letting records from different sections interleave.
+
+### Prototype limitations
+
+- **No cross-source deduplication.** Data-object samples carry `Sample.Hash = 0`, so the merge never
+  reconciles them against ingester or chunk-store samples. This is safe only if the routing keeps
+  the data-object window strictly older than the other tiers (a line is served by exactly one tier) and
+  data objects are internally deduplicated when built. It is also what lets the reader skip the
+  message column for `count`/`rate`, since a content hash would otherwise force reading every line
+  or a pre-computed line hash.
+- **Partial delete enforcement.** The query path receives only the delete requests the chunk compactor
+  has not yet fully processed; once it finishes a request, that filter is no longer supplied. Because
+  data objects are not physically compacted, a line deleted from chunks can resurface from data objects
+  after that point. The fix is to retain delete requests at least as long as data-object retention.
 
 ## Reproducing the benchmark comparison (agent prompt)
 

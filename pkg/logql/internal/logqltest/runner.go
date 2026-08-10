@@ -36,34 +36,36 @@ func RunScript(t *testing.T, name, script string) {
 
 	var (
 		store          *testingChunkStore
-		querier        logql.Querier
+		chunksQuerier  logql.Querier
+		dataObjQuerier logql.Querier
 		streams        = newStreamsParser()
 		streamsChanged = true
 	)
 
-	// The loaded streams are materialised into a real chunk store, rebuilt whenever the data
-	// changes (after load/clear) and reused across the evals that query it.
+	// The loaded streams are materialised into a real chunk store and an equivalent data object,
+	// rebuilt whenever the data changes (after load/clear) and reused across the evals that query them.
 	defer func() {
 		if store != nil {
 			store.close()
 		}
 	}()
-	getQuerier := func() logql.Querier {
+	// rebuildQueriers materialises the loaded streams into a chunk store and an equivalent data object,
+	// but only when the data changed since the last build. Both queriers are always used together, so
+	// one rebuild feeds both.
+	rebuildQueriers := func() {
 		if !streamsChanged {
-			return querier
+			return
 		}
-
 		if store != nil {
 			store.close()
 		}
-
+		loaded := streams.get()
 		store = newTestingChunkStore(t)
-		store.write(t, streams.get())
+		store.write(t, loaded)
 		store.flush(t)
-		querier = store.querier()
+		chunksQuerier = store.querier()
+		dataObjQuerier = newTestingDataObjQuerier(t, store.store, loaded)
 		streamsChanged = false
-
-		return querier
 	}
 
 	lines := strings.Split(script, "\n")
@@ -105,14 +107,15 @@ func RunScript(t *testing.T, name, script string) {
 			if err := exp.validate(); err != nil {
 				t.Fatalf("%s: eval %q: %v", name, cmd.query, err)
 			}
-			runEval(t, name, getQuerier(), cmd, exp)
+			rebuildQueriers()
+			runEval(t, name, chunksQuerier, dataObjQuerier, cmd, exp)
 		default:
 			t.Fatalf("%s: unexpected command %q", name, fields[0])
 		}
 	}
 }
 
-func runEval(t *testing.T, name string, querier logql.Querier, cmd evalCmd, exp expectations) {
+func runEval(t *testing.T, name string, chunksQuerier, dataObjQuerier logql.Querier, cmd evalCmd, exp expectations) {
 	t.Helper()
 	label := cmd.query
 	if cmd.instant {
@@ -121,22 +124,26 @@ func runEval(t *testing.T, name string, querier logql.Querier, cmd evalCmd, exp 
 		label = "range: " + label
 	}
 
-	// Every scenario runs under both execution paths: the default per-timestamp order and the
-	// opt-in per-stream order. Both must produce the expected result. Queries that are ineligible
-	// for stream-first execution transparently fall back to the default path, so running them with
-	// the flag on is still valid and must match.
+	// Every scenario runs under three paths, all of which must produce the expected result.
 	modes := []struct {
 		name          string
 		streamOrdered bool
+		querier       logql.Querier
 	}{
-		{"timestamp-first", false},
-		{"stream-first", true},
+		// chunks-timestamp-first: the default per-timestamp order over the chunk store.
+		{"chunks-timestamp-first", false, chunksQuerier},
+		// chunks-stream-first: the opt-in per-stream order over the chunk store.
+		{"chunks-stream-first", true, chunksQuerier},
+		// data-objects: the per-stream order over the data-object reader, still on the v1 engine. A
+		// query that is ineligible for stream-first execution transparently falls back to the default
+		// path, which for this mode reads the chunk store, so it is still exercised and must match.
+		{"data-objects", true, dataObjQuerier},
 	}
 
 	t.Run(label, func(t *testing.T) {
 		for _, mode := range modes {
 			t.Run(mode.name, func(t *testing.T) {
-				engine := logql.NewEngine(logql.EngineOpts{StreamOrderedExecutionEnabled: mode.streamOrdered}, querier, logql.NoLimits, log.NewNopLogger())
+				engine := logql.NewEngine(logql.EngineOpts{StreamOrderedExecutionEnabled: mode.streamOrdered}, mode.querier, logql.NoLimits, log.NewNopLogger())
 
 				var start, end, step time.Duration
 				if cmd.instant {

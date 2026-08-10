@@ -2,6 +2,7 @@ package logql_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math/rand"
@@ -18,15 +19,24 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/require"
+	"github.com/thanos-io/objstore"
+	"github.com/thanos-io/objstore/providers/filesystem"
 	"go.uber.org/atomic"
+
+	"github.com/grafana/loki/pkg/push"
 
 	"github.com/grafana/loki/v3/pkg/chunkenc"
 	"github.com/grafana/loki/v3/pkg/compression"
+	"github.com/grafana/loki/v3/pkg/dataobj"
+	"github.com/grafana/loki/v3/pkg/dataobj/consumer/logsobj"
+	"github.com/grafana/loki/v3/pkg/dataobj/metastore"
+	"github.com/grafana/loki/v3/pkg/dataobj/sections/streams"
 	ingesterclient "github.com/grafana/loki/v3/pkg/ingester/client"
 	"github.com/grafana/loki/v3/pkg/iter"
 	"github.com/grafana/loki/v3/pkg/logproto"
 	"github.com/grafana/loki/v3/pkg/logql"
 	"github.com/grafana/loki/v3/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/querier"
 	"github.com/grafana/loki/v3/pkg/storage"
 	"github.com/grafana/loki/v3/pkg/storage/chunk"
 	"github.com/grafana/loki/v3/pkg/storage/chunk/client"
@@ -42,7 +52,7 @@ const (
 	benchTenant = "fake"
 
 	// Fixture parameters: changing any of these changes the content hash, regenerating the cache.
-	fixtureVersion   = 2 // bump when the generation logic changes
+	fixtureVersion   = 5 // bump when the generation logic changes
 	fixtureSeed      = 1
 	benchNumStreams  = 2000
 	benchLinesPerStr = 5000
@@ -59,6 +69,10 @@ const (
 	labelSubsetValue    = "team-canary-00000001"
 	labelSubsetPeriod   = 50 // 1 in 50 streams
 	labelUniqueName     = "pod"
+
+	// Data-object fixture sizing: each object grows to ~32 MB (≈32x an average ~1 MB chunk) before it
+	// is flushed, so the same 1 GB corpus becomes ~20 objects vs ~2000 chunks.
+	benchDataObjTargetSize = 32 << 20
 )
 
 var (
@@ -79,9 +93,9 @@ func BenchmarkLogQLQueries(b *testing.B) {
 	}
 
 	var (
-		latency = &atomic.Int64{}
-		querier = openBenchStore(b, ensureBenchFixtures(b), latency)
-		ctx     = user.InjectOrgID(context.Background(), benchTenant)
+		counters                     = &benchCounters{}
+		chunkQuerier, dataobjQuerier = openBenchStore(b, ensureBenchFixtures(b), counters)
+		ctx                          = user.InjectOrgID(context.Background(), benchTenant)
 
 		all     = fmt.Sprintf("{%s=%q}", labelAllName, labelAllValue)
 		subset  = fmt.Sprintf("{%s=%q}", labelSubsetName, labelSubsetValue)
@@ -113,14 +127,18 @@ func BenchmarkLogQLQueries(b *testing.B) {
 			{"per-stream", true},
 		}
 
-		// benchSources isolate cross-source dedup cost: store_without_duplicates reads once;
-		// store_with_duplicates reads twice and merges, so the merge must dedup every sample.
+		// benchSources compare backends and isolate cross-source dedup cost: *_without_duplicates reads
+		// once; chunk_store_with_duplicates reads twice and merges, so the merge must dedup every sample.
+		// The data-object source is read only under stream-ordered execution (requiresStreamOrdered),
+		// so it is skipped in per-timestamp mode.
 		benchSources = []struct {
-			name string
-			q    logql.Querier
+			name                  string
+			q                     logql.Querier
+			requiresStreamOrdered bool
 		}{
-			{"store_without_duplicates", querier},
-			{"store_with_duplicates", newDuplicatingBenchQuerier(querier)},
+			{"chunk_store_without_duplicates", chunkQuerier, false},
+			{"chunk_store_with_duplicates", newDuplicatingBenchQuerier(chunkQuerier), false},
+			{"dataobj_store_without_duplicates", dataobjQuerier, true},
 		}
 
 		benchLatencies = []struct {
@@ -142,9 +160,12 @@ func BenchmarkLogQLQueries(b *testing.B) {
 	for _, m := range benchModes {
 		b.Run("mode="+m.name, func(b *testing.B) {
 			for _, src := range benchSources {
-				engine := logql.NewEngine(logql.EngineOpts{StreamOrderedExecutionEnabled: m.streamOrdered}, src.q, logql.NoLimits, log.NewNopLogger())
-
 				b.Run("source="+src.name, func(b *testing.B) {
+					if src.requiresStreamOrdered && !m.streamOrdered {
+						b.Skipf("source %q is read only under stream-ordered execution", src.name)
+					}
+					engine := logql.NewEngine(logql.EngineOpts{StreamOrderedExecutionEnabled: m.streamOrdered}, src.q, logql.NoLimits, log.NewNopLogger())
+
 					for _, q := range benchQueries {
 						start, end, step := benchStart, benchEnd, benchStep
 						if q.instant {
@@ -156,13 +177,17 @@ func BenchmarkLogQLQueries(b *testing.B) {
 						b.Run("query="+q.name, func(b *testing.B) {
 							for _, lat := range benchLatencies {
 								b.Run("latency="+lat.name, func(b *testing.B) {
-									latency.Store(int64(lat.d))
+									counters.latencyNs.Store(int64(lat.d))
 									runQuery(b, engine, params) // untimed warmup: warm index/shipper state
+									counters.Reset()
 									b.ReportAllocs()
 									b.ResetTimer()
 									for i := 0; i < b.N; i++ {
 										runQuery(b, engine, params)
 									}
+									b.StopTimer()
+									b.ReportMetric(float64(counters.requests.Load())/float64(b.N), "store_reqs/op")
+									b.ReportMetric(float64(counters.bytes.Load())/float64(b.N), "store_bytes/op")
 								})
 							}
 						})
@@ -173,35 +198,161 @@ func BenchmarkLogQLQueries(b *testing.B) {
 	}
 }
 
-// latencyObjectClient sleeps a fixed per-GET latency before each chunk read (index reads excluded),
-// so the benchmark isolates chunk-fetch latency. The delay is a shared atomic, mutated per scenario.
-type latencyObjectClient struct {
-	client.ObjectClient
-	latencyNs *atomic.Int64
+// benchCounters holds the injected per-request object-storage latency plus request/byte tallies. It
+// is shared by the chunk and data-object backends; since only one source runs per sub-benchmark, a
+// single instance measures whichever backend is under test.
+type benchCounters struct {
+	latencyNs atomic.Int64
+	requests  atomic.Int64
+	bytes     atomic.Int64
 }
 
-// applyChunkLatency sleeps the configured per-GET latency for chunk objects (index reads excluded).
-func (c *latencyObjectClient) applyChunkLatency(key string) {
-	if strings.HasPrefix(key, "index") {
-		return // index reads are not the thing under test
-	}
+func (c *benchCounters) sleep() {
 	if d := c.latencyNs.Load(); d > 0 {
 		time.Sleep(time.Duration(d))
 	}
 }
 
-func (c *latencyObjectClient) GetObject(ctx context.Context, key string) (io.ReadCloser, int64, error) {
-	c.applyChunkLatency(key)
-	return c.ObjectClient.GetObject(ctx, key)
+// Reset zeroes the request and byte tallies (not the injected latency) before a timed run.
+func (c *benchCounters) Reset() {
+	c.requests.Store(0)
+	c.bytes.Store(0)
 }
 
-func (c *latencyObjectClient) GetObjectRange(ctx context.Context, key string, off, length int64) (io.ReadCloser, error) {
-	c.applyChunkLatency(key)
-	return c.ObjectClient.GetObjectRange(ctx, key, off, length)
+type benchCountingReadCloser struct {
+	inner io.ReadCloser
+	c     *benchCounters
 }
 
-// benchStoreConfig builds the filesystem+TSDB store config rooted at dir, with optional latency injection.
-func benchStoreConfig(dir string, latencyNs *atomic.Int64) (storage.Config, config.SchemaConfig) {
+func (r benchCountingReadCloser) Read(p []byte) (int, error) {
+	n, err := r.inner.Read(p)
+	r.c.bytes.Add(int64(n))
+	return n, err
+}
+func (r benchCountingReadCloser) Close() error { return r.inner.Close() }
+
+// benchCountingObjectClient counts and delays every chunk read, so the benchmark reports chunk
+// object-storage requests and bytes alongside ns/op. Index reads are excluded: they are a fixed
+// overhead, not the chunk-fetch cost under test (the data-object backend's metastore is in-memory, so
+// only its object reads are counted, keeping the two comparable).
+type benchCountingObjectClient struct {
+	client.ObjectClient
+	c *benchCounters
+}
+
+func (o *benchCountingObjectClient) tracked(key string) bool { return !strings.HasPrefix(key, "index") }
+
+func (o *benchCountingObjectClient) GetObject(ctx context.Context, key string) (io.ReadCloser, int64, error) {
+	if !o.tracked(key) {
+		return o.ObjectClient.GetObject(ctx, key)
+	}
+	o.c.requests.Add(1)
+	o.c.sleep()
+	rc, sz, err := o.ObjectClient.GetObject(ctx, key)
+	if err != nil {
+		return rc, sz, err
+	}
+	return benchCountingReadCloser{rc, o.c}, sz, nil
+}
+
+func (o *benchCountingObjectClient) GetObjectRange(ctx context.Context, key string, off, length int64) (io.ReadCloser, error) {
+	if !o.tracked(key) {
+		return o.ObjectClient.GetObjectRange(ctx, key, off, length)
+	}
+	o.c.requests.Add(1)
+	o.c.sleep()
+	rc, err := o.ObjectClient.GetObjectRange(ctx, key, off, length)
+	if err != nil {
+		return rc, err
+	}
+	return benchCountingReadCloser{rc, o.c}, nil
+}
+
+// benchCountingBucket is the data-object counterpart of benchCountingObjectClient: it counts and delays
+// every object read so the benchmark reports the same store_reqs/store_bytes metrics.
+type benchCountingBucket struct {
+	objstore.Bucket
+	c *benchCounters
+}
+
+func (b *benchCountingBucket) Get(ctx context.Context, name string) (io.ReadCloser, error) {
+	b.c.requests.Add(1)
+	b.c.sleep()
+	rc, err := b.Bucket.Get(ctx, name)
+	if err != nil {
+		return rc, err
+	}
+	return benchCountingReadCloser{rc, b.c}, nil
+}
+
+func (b *benchCountingBucket) GetRange(ctx context.Context, name string, off, length int64) (io.ReadCloser, error) {
+	b.c.requests.Add(1)
+	b.c.sleep()
+	rc, err := b.Bucket.GetRange(ctx, name, off, length)
+	if err != nil {
+		return rc, err
+	}
+	return benchCountingReadCloser{rc, b.c}, nil
+}
+
+// benchMetastore filters section descriptors by the query's stream matchers, mirroring the postings
+// index. It is enough to drive the data-object reader over the built objects.
+type benchMetastore struct {
+	objects []benchMetaObject
+}
+
+type benchMetaObject struct {
+	path    string
+	streams []streams.Stream
+}
+
+func (m *benchMetastore) Sections(_ context.Context, req metastore.SectionsRequest) (metastore.SectionsResponse, error) {
+	var out []*metastore.DataobjSectionDescriptor
+	for _, o := range m.objects {
+		var ids []int64
+		for _, s := range o.streams {
+			if matchesAll(req.Matchers, s.Labels) {
+				ids = append(ids, s.ID)
+			}
+		}
+		if len(ids) > 0 {
+			out = append(out, &metastore.DataobjSectionDescriptor{
+				SectionKey: metastore.SectionKey{ObjectPath: o.path, SectionIdx: 0},
+				StreamIDs:  ids,
+			})
+		}
+	}
+	return metastore.SectionsResponse{Sections: out}, nil
+}
+
+func (m *benchMetastore) GetIndexes(context.Context, metastore.GetIndexesRequest) (metastore.GetIndexesResponse, error) {
+	return metastore.GetIndexesResponse{}, nil
+}
+func (m *benchMetastore) IndexSectionsReader(context.Context, metastore.IndexSectionsReaderRequest) (metastore.IndexSectionsReaderResponse, error) {
+	return metastore.IndexSectionsReaderResponse{}, nil
+}
+func (m *benchMetastore) CollectSections(context.Context, metastore.CollectSectionsRequest) (metastore.CollectSectionsResponse, error) {
+	return metastore.CollectSectionsResponse{}, nil
+}
+func (m *benchMetastore) Labels(context.Context, time.Time, time.Time, ...*labels.Matcher) ([]string, error) {
+	return nil, nil
+}
+func (m *benchMetastore) Values(context.Context, time.Time, time.Time, ...*labels.Matcher) ([]string, error) {
+	return nil, nil
+}
+
+func matchesAll(matchers []*labels.Matcher, lbls labels.Labels) bool {
+	for _, m := range matchers {
+		if !m.Matches(lbls.Get(m.Name)) {
+			return false
+		}
+	}
+	return true
+}
+
+// benchStoreConfig builds the filesystem+TSDB store config rooted at dir, with optional per-read
+// counting + latency injection.
+func benchStoreConfig(dir string, counters *benchCounters) (storage.Config, config.SchemaConfig) {
 	storeConfig := storage.Config{
 		MaxChunkBatchSize:   50,
 		MaxParallelGetChunk: 150, // production default; the literal Config skips RegisterFlags
@@ -215,9 +366,9 @@ func benchStoreConfig(dir string, latencyNs *atomic.Int64) (storage.Config, conf
 		},
 		FSConfig: local.FSConfig{Directory: filepath.Join(dir, "storage")},
 	}
-	if latencyNs != nil {
+	if counters != nil {
 		storeConfig.ObjectClientDecorator = func(oc client.ObjectClient) client.ObjectClient {
-			return &latencyObjectClient{ObjectClient: oc, latencyNs: latencyNs}
+			return &benchCountingObjectClient{ObjectClient: oc, c: counters}
 		}
 	}
 	period := config.PeriodConfig{
@@ -234,11 +385,18 @@ func benchStoreConfig(dir string, latencyNs *atomic.Int64) (storage.Config, conf
 	return storeConfig, schemaCfg
 }
 
-// openBenchStore opens a LokiStore over dir (fixtures already present). No chunk cache, so every
+// openBenchStore opens both backends over the fixture dir, sharing counters: the chunk LokiStore and a
+// stream-first data-object reader over <dir>/dataobj.
+func openBenchStore(b *testing.B, dir string, counters *benchCounters) (*storage.LokiStore, logql.Querier) {
+	b.Helper()
+	return openBenchChunkStore(b, dir, counters), openBenchDataObjStore(b, dir, counters)
+}
+
+// openBenchChunkStore opens a LokiStore over dir (fixtures already present). No chunk cache, so every
 // fetch hits the object store.
-func openBenchStore(tb testing.TB, dir string, latencyNs *atomic.Int64) *storage.LokiStore {
+func openBenchChunkStore(tb testing.TB, dir string, counters *benchCounters) *storage.LokiStore {
 	tb.Helper()
-	storeConfig, schemaCfg := benchStoreConfig(dir, latencyNs)
+	storeConfig, schemaCfg := benchStoreConfig(dir, counters)
 
 	// Pre-warm the memoized schema version single-threaded.
 	for i := range schemaCfg.Configs {
@@ -256,6 +414,60 @@ func openBenchStore(tb testing.TB, dir string, latencyNs *atomic.Int64) *storage
 	return store
 }
 
+// openBenchDataObjStore opens a stream-first data-object reader over the objects written to
+// <dir>/dataobj by buildBenchDataObjects, through an instrumented bucket. The metastore is
+// reconstructed in-memory from each object's streams section (untimed setup, via the raw bucket).
+func openBenchDataObjStore(b *testing.B, dir string, counters *benchCounters) logql.Querier {
+	b.Helper()
+	ctx := user.InjectOrgID(context.Background(), benchTenant)
+
+	fsBucket, err := filesystem.NewBucket(benchDataObjDir(dir))
+	require.NoError(b, err)
+
+	var metaObjects []benchMetaObject
+	require.NoError(b, fsBucket.Iter(ctx, "", func(name string) error {
+		obj, err := dataobj.FromBucket(ctx, fsBucket, name, 0)
+		if err != nil {
+			return err
+		}
+		metaObjects = append(metaObjects, benchMetaObject{path: name, streams: benchStreamsOf(b, ctx, obj)})
+		return nil
+	}))
+	require.NotEmpty(b, metaObjects, "no data objects found in the fixtures; regenerate them")
+
+	bucket := &benchCountingBucket{Bucket: fsBucket, c: counters}
+	return querier.NewDataObjSampleStore(nil, bucket, &benchMetastore{objects: metaObjects}, log.NewNopLogger())
+}
+
+// benchDataObjDir is the sub-directory of a fixture dir that holds the data objects.
+func benchDataObjDir(dir string) string { return filepath.Join(dir, "dataobj") }
+
+func benchStreamsOf(b *testing.B, ctx context.Context, obj *dataobj.Object) []streams.Stream {
+	b.Helper()
+	var out []streams.Stream
+	for _, sec := range obj.Sections().Filter(streams.CheckSection) {
+		ss, err := streams.Open(ctx, sec)
+		require.NoError(b, err)
+		r := streams.NewRowReader(ss)
+		buf := make([]streams.Stream, 1024)
+		require.NoError(b, r.Open(ctx))
+		for {
+			n, err := r.Read(ctx, buf)
+			if err != nil && !errors.Is(err, io.EOF) {
+				require.NoError(b, err)
+			}
+			for i := range buf[:n] {
+				out = append(out, streams.Stream{ID: buf[i].ID, Labels: buf[i].Labels})
+			}
+			if n == 0 && errors.Is(err, io.EOF) {
+				break
+			}
+		}
+		r.Close()
+	}
+	return out
+}
+
 func newBenchMemChunk() *chunkenc.MemChunk {
 	const (
 		targetChunkSize = 1024 * 1024
@@ -264,34 +476,93 @@ func newBenchMemChunk() *chunkenc.MemChunk {
 	return chunkenc.NewMemChunk(chunkenc.ChunkFormatV4, compression.Snappy, chunkenc.UnorderedWithStructuredMetadataHeadBlockFmt, blockSize, targetChunkSize)
 }
 
-// writeBenchStream encodes one stream into one or more chunks and Puts them into the store.
-func writeBenchStream(tb testing.TB, store *storage.LokiStore, stream logproto.Stream) {
+// buildBenchChunks writes the corpus into a filesystem chunk store + TSDB index rooted at dir, using
+// the same deterministic streams as the data objects so the two backends answer identically. Each
+// stream is encoded into one or more ~1 MB chunks.
+func buildBenchChunks(tb testing.TB, dir string) {
 	tb.Helper()
-	lbs, err := syntax.ParseLabels(stream.Labels)
-	require.NoError(tb, err)
-	metric := labels.NewBuilder(lbs).Set(model.MetricNameLabel, "logs").Labels()
-	fp := ingesterclient.Fingerprint(lbs)
+	store := openBenchChunkStore(tb, dir, nil) // nil counters: generation is neither counted nor delayed
+	rng := newBenchRNG()
 
-	put := func(mc *chunkenc.MemChunk) {
-		require.NoError(tb, mc.Close())
-		firstTime, lastTime := util.RoundToMilliseconds(mc.Bounds())
-		c := chunk.NewChunk(benchTenant, fp, metric, chunkenc.NewFacade(mc, 0, 0), firstTime, lastTime)
-		require.NoError(tb, c.Encode())
-		require.NoError(tb, store.Put(context.Background(), []chunk.Chunk{c}))
-	}
-
-	mc := newBenchMemChunk()
-	for i := range stream.Entries {
-		e := stream.Entries[i]
-		if !mc.SpaceFor(&e) {
-			put(mc)
-			mc = newBenchMemChunk()
-		}
-		dup, err := mc.Append(&e)
+	for i := 0; i < benchNumStreams; i++ {
+		stream := generateBenchStream(i, rng)
+		lbs, err := syntax.ParseLabels(stream.Labels)
 		require.NoError(tb, err)
-		require.Falsef(tb, dup, "duplicate entry in stream %s at %s", stream.Labels, e.Timestamp)
+		metric := labels.NewBuilder(lbs).Set(model.MetricNameLabel, "logs").Labels()
+		fp := ingesterclient.Fingerprint(lbs)
+
+		put := func(mc *chunkenc.MemChunk) {
+			require.NoError(tb, mc.Close())
+			firstTime, lastTime := util.RoundToMilliseconds(mc.Bounds())
+			c := chunk.NewChunk(benchTenant, fp, metric, chunkenc.NewFacade(mc, 0, 0), firstTime, lastTime)
+			require.NoError(tb, c.Encode())
+			require.NoError(tb, store.Put(context.Background(), []chunk.Chunk{c}))
+		}
+
+		mc := newBenchMemChunk()
+		for j := range stream.Entries {
+			e := stream.Entries[j]
+			if !mc.SpaceFor(&e) {
+				put(mc)
+				mc = newBenchMemChunk()
+			}
+			dup, err := mc.Append(&e)
+			require.NoError(tb, err)
+			require.Falsef(tb, dup, "duplicate entry in stream %s at %s", stream.Labels, e.Timestamp)
+		}
+		put(mc)
 	}
-	put(mc)
+
+	store.Stop()
+}
+
+// buildBenchDataObjects writes the corpus as ~64 MB data objects into <dir>/dataobj, using the same
+// deterministic streams as the chunk fixtures so the two backends answer identically.
+func buildBenchDataObjects(tb testing.TB, dir string) {
+	tb.Helper()
+	ctx := user.InjectOrgID(context.Background(), benchTenant)
+
+	bucket, err := filesystem.NewBucket(benchDataObjDir(dir))
+	require.NoError(tb, err)
+
+	cfg := logsobj.BuilderConfig{BuilderBaseConfig: logsobj.BuilderBaseConfig{
+		TargetPageSize:          2 << 20,
+		TargetObjectSize:        benchDataObjTargetSize,
+		TargetSectionSize:       benchDataObjTargetSize,
+		BufferSize:              4 << 20,
+		SectionStripeMergeLimit: 2,
+	}}
+
+	newBuilder := func() *logsobj.Builder {
+		builder, err := logsobj.NewBuilder(cfg, nil, logsobj.NewBuilderMetrics(), log.NewNopLogger(), nil)
+		require.NoError(tb, err)
+		return builder
+	}
+
+	objIdx := 0
+	flush := func(builder *logsobj.Builder) {
+		obj, closer, err := builder.Flush()
+		require.NoError(tb, err)
+		reader, err := obj.Reader(ctx)
+		require.NoError(tb, err)
+		require.NoError(tb, bucket.Upload(ctx, fmt.Sprintf("%04d", objIdx), reader))
+		require.NoError(tb, reader.Close())
+		require.NoError(tb, closer.Close())
+		objIdx++
+	}
+
+	rng := newBenchRNG() // same sequence as the chunk fixtures, so windows/data match
+	builder := newBuilder()
+	for i := 0; i < benchNumStreams; i++ {
+		// The builder reports full once its estimated size passes TargetObjectSize; flush it and start
+		// a fresh object before appending the stream that would push it further over.
+		if builder.IsFull() {
+			flush(builder)
+			builder = newBuilder()
+		}
+		require.NoError(tb, builder.Append(benchTenant, generateBenchStream(i, rng), benchStart))
+	}
+	flush(builder) // the final object is partial: flush whatever the last builder holds
 }
 
 // ensureBenchFixtures generates the fixtures once into a content-addressed dir (reused if its
@@ -307,14 +578,9 @@ func ensureBenchFixtures(tb testing.TB) string {
 	require.NoError(tb, err)
 	defer os.RemoveAll(tmp)
 
-	genLatency := &atomic.Int64{} // zero: generation is not delayed
-	store := openBenchStore(tb, tmp, genLatency)
-
-	rng := newBenchRNG()
-	for i := 0; i < benchNumStreams; i++ {
-		writeBenchStream(tb, store, generateBenchStream(i, rng))
-	}
-	store.Stop()
+	// Both backends over the same deterministic corpus, so a query can be benchmarked against either.
+	buildBenchChunks(tb, tmp)
+	buildBenchDataObjects(tb, tmp)
 
 	require.NoError(tb, os.WriteFile(filepath.Join(tmp, ".done"), []byte(benchFixtureHash()), 0o644))
 	if err := os.Rename(tmp, final); err != nil {
@@ -394,7 +660,15 @@ func generateBenchStream(i int, rng *rand.Rand) logproto.Stream {
 	entries := make([]logproto.Entry, benchLinesPerStr)
 	for j := 0; j < benchLinesPerStr; j++ {
 		ts := benchStart.Add(time.Duration(offsetSecs+int64(j)*stepSecs) * time.Second)
-		entries[j] = logproto.Entry{Timestamp: ts, Line: benchLine(i, j)}
+		entries[j] = logproto.Entry{
+			Timestamp: ts,
+			Line:      benchLine(i, j),
+			StructuredMetadata: push.LabelsAdapter{
+				{Name: "trace_id", Value: fmt.Sprintf("trace-%06d-%06d", i, j)}, // unique per line
+				{Name: "span_id", Value: fmt.Sprintf("span-%06d-%06d", i, j)},   // unique per line
+				{Name: "shard", Value: fmt.Sprintf("shard-%02d", j%50)},         // 50 unique values
+			},
+		}
 	}
 	return logproto.Stream{Labels: lbls.String(), Entries: entries}
 }
@@ -404,9 +678,11 @@ func newBenchRNG() *rand.Rand {
 	return rand.New(rand.NewSource(fixtureSeed)) //nolint:gosec // determinism, not security
 }
 
-// benchFixtureHash is the content-addressed cache key derived from the fixture parameters.
+// benchFixtureHash is the content-addressed cache key derived from the fixture parameters, including
+// the data-object sizing so a change to it regenerates both backends' fixtures.
 func benchFixtureHash() string {
-	return fmt.Sprintf("v%d-s%d-str%d-lin%d-b%d", fixtureVersion, fixtureSeed, benchNumStreams, benchLinesPerStr, benchLineBytes)
+	return fmt.Sprintf("v%d-s%d-str%d-lin%d-b%d-do%d",
+		fixtureVersion, fixtureSeed, benchNumStreams, benchLinesPerStr, benchLineBytes, benchDataObjTargetSize)
 }
 
 // duplicatingBenchQuerier reads the store twice with the same request and merges the two identical
