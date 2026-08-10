@@ -17,6 +17,14 @@ import (
 	"github.com/grafana/loki/v3/pkg/dataobj/sections/streams"
 )
 
+// dataObjHeadPrefetchBytes is how many bytes FromBucket reads up front when opening an object. The
+// encoder packs the file metadata and every section's metadata region contiguously at the head, so
+// prefetching a window large enough to cover them serves each section's metadata and column descriptors
+// from memory instead of a per-section round-trip; only the page data (in the later data regions) then
+// needs a read. This trades a larger head read for fewer serial round-trips, which pays off at high
+// object-storage latency.
+const dataObjHeadPrefetchBytes = 256 * 1024
+
 // dataObjCache opens each data object once per query and caches the opened object and its sections.
 // The same object is read first for stream labels and then for log rows, so caching avoids re-reading
 // the object header and section metadata.
@@ -50,7 +58,7 @@ func (c *dataObjCache) get(ctx context.Context, path string) (*openObject, error
 
 	// Open outside the lock so concurrent opens of different objects don't serialize on the object
 	// storage I/O.
-	obj, err := dataobj.FromBucket(ctx, c.bucket, path, 0)
+	obj, err := dataobj.FromBucket(ctx, c.bucket, path, dataObjHeadPrefetchBytes)
 	if err != nil {
 		return nil, err
 	}

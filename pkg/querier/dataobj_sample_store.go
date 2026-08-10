@@ -90,19 +90,13 @@ func (s *dataObjSampleStore) SelectSamples(ctx context.Context, req logql.Select
 	}
 
 	cache := newDataObjCache(s.bucket, tenantID)
-	tasks, err := newDataObjReadPlanner(s.ms, cache).Plan(ctx, req.Start, req.End, matchers, shard, expr)
-	if err != nil {
-		cache.Close()
-		return nil, err
-	}
-	if len(tasks) == 0 {
-		cache.Close()
-		return iter.NoopSampleIterator, nil
-	}
-
-	// The reader owns the cache from here and closes it on Close.
+	tasks := newDataObjReadPlanner(s.ms, cache).plan(ctx, req.Start, req.End, matchers, shard, expr)
 	reader := newDataObjLogReader(ctx, cache, tasks, defaultMaxConcurrency, defaultReadBatchSize)
-	return newDataObjSampleIterator(reader, extractors), nil
+
+	// dataObjAbortReader stops the background planner (and, through the reader's Close, releases the
+	// cache) once reading finishes or on Close. A resolution error surfaces through the reader's Err;
+	// no matching sections is not an error — the reader yields no samples with a nil Err.
+	return newDataObjSampleIterator(newDataObjAbortReader(reader, tasks), extractors), nil
 }
 
 // stripNonStreamMatchers drops the synthetic matchers (__name__, __cortex_shard__) that the metastore

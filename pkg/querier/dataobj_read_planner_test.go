@@ -247,10 +247,8 @@ func TestDataObjReadPlanner_Plan(t *testing.T) {
 	matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "cluster", "test")}
 
 	plan := func(bucket objstore.Bucket, ms metastore.Metastore, shard *logql.Shard) []dataObjReadTask {
-		tasks, err := newDataObjReadPlanner(ms, newDataObjCache(bucket, dataObjTestTenant)).
-			Plan(ctx, start, end, matchers, shard, expr)
-		require.NoError(t, err)
-		return tasks
+		return drainTaskIterator(t, newDataObjReadPlanner(ms, newDataObjCache(bucket, dataObjTestTenant)).
+			plan(ctx, start, end, matchers, shard, expr))
 	}
 
 	// fpByLabels maps each app's stream-label string to its fingerprint (the StableHash of the labels).

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/prometheus/common/model"
@@ -21,6 +22,12 @@ const (
 	// maxParallelObjectResolves bounds how many objects the planner resolves (opens + reads the streams
 	// section) concurrently.
 	maxParallelObjectResolves = 128
+
+	// planBufferSize is the task-channel buffer for plan. It is large so the background planner runs well
+	// ahead of the reader and effectively never blocks on it. The channel holds one task per logs section;
+	// a corpus rarely has more than a few hundred sections, and a dataObjReadTask is small, so the memory
+	// bound is negligible.
+	planBufferSize = 1024
 )
 
 // streamID identifies a stream within a data object. The object's builder assigns it and it is local to
@@ -130,49 +137,60 @@ func newDataObjReadPlanner(ms metastore.Metastore, cache *dataObjCache) *dataObj
 	return &dataObjReadPlanner{ms: ms, cache: cache}
 }
 
-func (p *dataObjReadPlanner) Plan(ctx context.Context, start, end time.Time, matchers []*labels.Matcher, shard *logql.Shard, expr syntax.SampleExpr) ([]dataObjReadTask, error) {
-	resp, err := p.ms.Sections(ctx, metastore.SectionsRequest{Start: start, End: end, Matchers: matchers})
-	if err != nil {
-		return nil, fmt.Errorf("resolving data object sections: %w", err)
-	}
+// plan resolves the query's sections and streams the resulting read tasks through a
+// dataObjTaskIterator. Resolution (the metastore lookup, then each object's streams read) runs in a
+// background goroutine, so the reader can start reading one object's logs while later objects are still
+// being resolved. A resolution error is recorded on the iterator and surfaced through its Err.
+func (p *dataObjReadPlanner) plan(ctx context.Context, start, end time.Time, matchers []*labels.Matcher, shard *logql.Shard, expr syntax.SampleExpr) *dataObjTaskIterator {
+	ctx, cancel := context.WithCancel(ctx)
+	ch := make(chan dataObjReadTask, planBufferSize)
+	it := newDataObjTaskIterator(ch, cancel)
 
-	return p.planObjectsRead(ctx, resp.Sections, readQuery{expr: expr, shard: shard, start: start, end: end})
+	go func() {
+		defer close(it.done)
+		defer close(ch)
+
+		resp, err := p.ms.Sections(ctx, metastore.SectionsRequest{Start: start, End: end, Matchers: matchers})
+		if err != nil {
+			it.setErr(fmt.Errorf("resolving data object sections: %w", err))
+			return
+		}
+		if err := p.planObjectsRead(ctx, resp.Sections, readQuery{expr: expr, shard: shard, start: start, end: end}, ch); err != nil {
+			it.setErr(err)
+		}
+	}()
+
+	return it
 }
 
-// planObjectsRead groups the resolved sections by object and plans each object's read concurrently:
-// opening an object and reading its streams section is I/O bound.
-func (p *dataObjReadPlanner) planObjectsRead(ctx context.Context, sections []*metastore.DataobjSectionDescriptor, q readQuery) ([]dataObjReadTask, error) {
+// planObjectsRead groups the resolved sections by object and plans each object's read concurrently
+// (opening an object and reading its streams section is I/O bound), sending each object's tasks to out
+// as soon as that object is planned. It returns the first resolution error, or ctx.Err() if cancelled.
+func (p *dataObjReadPlanner) planObjectsRead(ctx context.Context, sections []*metastore.DataobjSectionDescriptor, q readQuery, out chan<- dataObjReadTask) error {
 	byObject := map[string][]*metastore.DataobjSectionDescriptor{}
 	for _, d := range sections {
 		byObject[d.ObjectPath] = append(byObject[d.ObjectPath], d)
 	}
-	paths := make([]string, 0, len(byObject))
-	for path := range byObject {
-		paths = append(paths, path)
-	}
 
-	perObject := make([][]dataObjReadTask, len(paths))
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(maxParallelObjectResolves)
-	for i, path := range paths {
+	for path, descs := range byObject {
 		g.Go(func() error {
-			tasks, err := p.planObjectRead(ctx, path, byObject[path], q)
+			tasks, err := p.planObjectRead(ctx, path, descs, q)
 			if err != nil {
 				return err
 			}
-			perObject[i] = tasks
+			for _, t := range tasks {
+				select {
+				case out <- t:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
 			return nil
 		})
 	}
-	if err := g.Wait(); err != nil {
-		return nil, err
-	}
-
-	var tasks []dataObjReadTask
-	for _, t := range perObject {
-		tasks = append(tasks, t...)
-	}
-	return tasks, nil
+	return g.Wait()
 }
 
 // planObjectRead reads one object's streams once, then plans the read of each of its logs sections.
@@ -440,4 +458,79 @@ func metadataMatcherPredicates(matchers []*labels.Matcher) []logs.RowPredicate {
 		}
 	}
 	return predicates
+}
+
+// dataObjTaskIterator streams read tasks from the planner to the reader. The planner fills it from a
+// background goroutine as it resolves objects; the reader consumes tasks as they arrive. Err returns any
+// resolution error once Next has returned false, so a planning failure reaches the reader the same way a
+// scan failure does.
+//
+// Next and At are for the single consumer goroutine only. Err, setErr, and Abort are safe for concurrent
+// use: the reader may Abort while the planner still runs.
+type dataObjTaskIterator struct {
+	tasks <-chan dataObjReadTask
+	curr  dataObjReadTask
+
+	// cancel stops the background planner; done is closed once that goroutine has exited. Abort uses them
+	// to stop the planner and wait for it, so the shared cache is released only after the planner lets go.
+	cancel context.CancelFunc
+	done   chan struct{}
+
+	errMu sync.Mutex
+	err   error
+}
+
+// newDataObjTaskIterator returns an iterator over tasks whose background planner is stopped by cancel. It
+// panics if tasks is nil: that is a programming error, and Next would otherwise block forever on it.
+func newDataObjTaskIterator(tasks <-chan dataObjReadTask, cancel context.CancelFunc) *dataObjTaskIterator {
+	if tasks == nil {
+		panic("newDataObjTaskIterator: tasks channel must not be nil")
+	}
+	return &dataObjTaskIterator{
+		tasks:  tasks,
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+}
+
+func (it *dataObjTaskIterator) Next() bool {
+	// A resolution error is terminal: stop at once rather than yield the tasks the planner queued (into
+	// the buffer) before it failed, mirroring how the log reader stops on a scan error. This avoids
+	// reading sections for a query that is already doomed to fail.
+	if it.Err() != nil {
+		return false
+	}
+	task, ok := <-it.tasks
+	if !ok {
+		return false
+	}
+	it.curr = task
+	return true
+}
+
+func (it *dataObjTaskIterator) At() dataObjReadTask { return it.curr }
+
+func (it *dataObjTaskIterator) Err() error {
+	it.errMu.Lock()
+	defer it.errMu.Unlock()
+	return it.err
+}
+
+func (it *dataObjTaskIterator) setErr(err error) {
+	it.errMu.Lock()
+	defer it.errMu.Unlock()
+	if it.err == nil {
+		it.err = err
+	}
+}
+
+// Abort records err (if non-nil), stops the background planner, and waits for it to exit. After Abort
+// returns, the planner no longer touches the shared cache, so the caller may release it. Abort is
+// idempotent and safe to call after a normal drain (cancel is a no-op and done is already closed).
+func (it *dataObjTaskIterator) Abort(err error) {
+	if err != nil {
+		it.setErr(err)
+	}
+	it.cancel()
+	<-it.done
 }

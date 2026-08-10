@@ -3,6 +3,7 @@ package querier
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -10,9 +11,11 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/stretchr/testify/require"
 	"github.com/thanos-io/objstore"
+	"go.uber.org/goleak"
 
 	"github.com/grafana/loki/pkg/push"
 
+	"github.com/grafana/loki/v3/pkg/dataobj/metastore"
 	"github.com/grafana/loki/v3/pkg/dataobj/sections/logs"
 	"github.com/grafana/loki/v3/pkg/logproto"
 	"github.com/grafana/loki/v3/pkg/logql/syntax"
@@ -70,11 +73,10 @@ func TestDataObjLogReader_MultiObject(t *testing.T) {
 	expr, err := syntax.ParseSampleExpr(`count_over_time({job="t"}[1h])`)
 	require.NoError(t, err)
 	matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "job", "t")}
-	tasks, err := newDataObjReadPlanner(ms, cache).Plan(ctx, at(0), at(100), matchers, nil, expr)
-	require.NoError(t, err)
+	tasks := newDataObjReadPlanner(ms, cache).plan(ctx, at(0), at(100), matchers, nil, expr)
 
 	// A small batch size forces multiple batches per section, exercising the batch boundary.
-	reader := newDataObjLogReader(ctx, cache, tasks, defaultMaxConcurrency, 2)
+	reader := newDataObjAbortReader(newDataObjLogReader(ctx, cache, tasks, defaultMaxConcurrency, 2), tasks)
 	t.Cleanup(func() { require.NoError(t, reader.Close()) })
 
 	type key struct {
@@ -127,14 +129,16 @@ func TestDataObjLogReader_ConcurrentSections(t *testing.T) {
 	expr, err := syntax.ParseSampleExpr(`count_over_time({job="t"}[1h])`)
 	require.NoError(t, err)
 	matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "job", "t")}
-	tasks, err := newDataObjReadPlanner(ms, cache).Plan(ctx, at(0), at(100), matchers, nil, expr)
-	require.NoError(t, err)
+	// Drain the plan first for the section-count assertions, then re-wrap it as a slice iterator so the
+	// reader consumes every task concurrently against the one shared openObject (the race under test).
+	tasks := drainTaskIterator(t, newDataObjReadPlanner(ms, cache).plan(ctx, at(0), at(100), matchers, nil, expr))
 	require.Greater(t, len(tasks), 1, "a tiny section size must split the object into several sections")
 	for _, task := range tasks {
 		require.Equal(t, tasks[0].object, task.object, "every task must read the same object")
 	}
 
-	reader := newDataObjLogReader(ctx, cache, tasks, defaultMaxConcurrency, defaultReadBatchSize)
+	sliceIt := newSliceTaskIterator(tasks)
+	reader := newDataObjAbortReader(newDataObjLogReader(ctx, cache, sliceIt, defaultMaxConcurrency, defaultReadBatchSize), sliceIt)
 	t.Cleanup(func() { require.NoError(t, reader.Close()) })
 
 	// A count_over_time projects stream_id + timestamp (not the message), so assert on the per-stream
@@ -231,7 +235,8 @@ func TestDataObjLogReader_UnexpectedStreamID(t *testing.T) {
 		end:              time.Unix(100, 0),
 	}
 
-	reader := newDataObjLogReader(ctx, newDataObjCache(bucket, dataObjTestTenant), []dataObjReadTask{task}, 1, defaultReadBatchSize)
+	it := newSliceTaskIterator([]dataObjReadTask{task})
+	reader := newDataObjAbortReader(newDataObjLogReader(ctx, newDataObjCache(bucket, dataObjTestTenant), it, 1, defaultReadBatchSize), it)
 	// Close surfaces the scan error, which this test expects and asserts via reader.Err() below.
 	t.Cleanup(func() { _ = reader.Close() })
 
@@ -239,4 +244,212 @@ func TestDataObjLogReader_UnexpectedStreamID(t *testing.T) {
 		_ = reader.At()
 	}
 	require.ErrorContains(t, reader.Err(), "unexpected stream ID")
+}
+
+// newSliceTaskIterator returns a dataObjTaskIterator that yields the given tasks then ends, with no
+// planning error (a test sets one with setErr if needed). It stands in for plan when a test supplies
+// tasks directly.
+func newSliceTaskIterator(tasks []dataObjReadTask) *dataObjTaskIterator {
+	ch := make(chan dataObjReadTask, len(tasks))
+	for _, t := range tasks {
+		ch <- t
+	}
+	close(ch)
+	it := newDataObjTaskIterator(ch, func() {})
+	close(it.done) // no planner goroutine, so Abort's wait returns immediately
+	return it
+}
+
+// drainTaskIterator collects every task the iterator yields and asserts it reported no error.
+func drainTaskIterator(t *testing.T, it *dataObjTaskIterator) []dataObjReadTask {
+	t.Helper()
+	var tasks []dataObjReadTask
+	for it.Next() {
+		tasks = append(tasks, it.At())
+	}
+	require.NoError(t, it.Err())
+	return tasks
+}
+
+// TestDataObjTaskIterator checks the iterator yields its tasks in order and surfaces a preset error.
+func TestDataObjTaskIterator(t *testing.T) {
+	a := dataObjReadTask{object: "a"}
+	b := dataObjReadTask{object: "b"}
+
+	it := newSliceTaskIterator([]dataObjReadTask{a, b})
+	require.True(t, it.Next())
+	require.Equal(t, "a", it.At().object)
+	require.True(t, it.Next())
+	require.Equal(t, "b", it.At().object)
+	require.False(t, it.Next())
+	require.NoError(t, it.Err())
+
+	wantErr := errors.New("boom")
+	errIt := newSliceTaskIterator(nil)
+	errIt.setErr(wantErr)
+	require.False(t, errIt.Next())
+	require.ErrorIs(t, errIt.Err(), wantErr)
+
+	// A set error stops iteration at once, even with tasks still buffered.
+	bufferedErrIt := newSliceTaskIterator([]dataObjReadTask{a, b})
+	bufferedErrIt.setErr(wantErr)
+	require.False(t, bufferedErrIt.Next(), "a set error must stop iteration without yielding buffered tasks")
+	require.ErrorIs(t, bufferedErrIt.Err(), wantErr)
+
+	require.Panics(t, func() { newDataObjTaskIterator(nil, func() {}) }, "a nil tasks channel is a programming error")
+}
+
+// TestDataObjTaskIterator_AbortCancelsBlockedPlanner checks Abort against a planner blocked on a full
+// buffer (modeled with an unbuffered channel and no consumer): Abort must cancel the planner so its send
+// unblocks, and then wait for it to exit. Without the cancel or the send's ctx.Done branch, Abort hangs;
+// without the wait, it would return before the planner released its resources.
+func TestDataObjTaskIterator_AbortCancelsBlockedPlanner(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	ch := make(chan dataObjReadTask) // unbuffered: with no consumer, the producer blocks on send
+	it := newDataObjTaskIterator(ch, cancel)
+
+	blocked := make(chan struct{})
+	go func() {
+		defer close(it.done)
+		close(blocked)
+		select {
+		case ch <- dataObjReadTask{}:
+		case <-ctx.Done():
+		}
+	}()
+	<-blocked
+
+	returned := make(chan struct{})
+	go func() {
+		it.Abort(errors.New("stop"))
+		close(returned)
+	}()
+	select {
+	case <-returned:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Abort did not return: it must cancel a blocked planner and wait for it to exit")
+	}
+
+	select {
+	case <-it.done:
+	default:
+		t.Fatal("Abort returned before the planner exited; it must wait on done")
+	}
+	require.ErrorContains(t, it.Err(), "stop")
+}
+
+// TestDataObjLogReader_PlanningError checks a resolution error carried by the task iterator surfaces
+// through the reader's Err, so a planning failure fails the query rather than returning an empty result.
+func TestDataObjLogReader_PlanningError(t *testing.T) {
+	wantErr := errors.New("resolving data object sections: boom")
+
+	it := newSliceTaskIterator(nil)
+	it.setErr(wantErr)
+
+	reader := newDataObjAbortReader(newDataObjLogReader(context.Background(), newDataObjCache(objstore.NewInMemBucket(), dataObjTestTenant), it, 1, 1), it)
+	t.Cleanup(func() { _ = reader.Close() })
+
+	var n int
+	for reader.Next() {
+		n++
+	}
+	require.Zero(t, n, "a planning error yields no records")
+	require.ErrorIs(t, reader.Err(), wantErr)
+}
+
+// TestDataObjLogReader_CloseBeforeDrain closes the reader after reading a single record, while a scan is
+// still in flight, and asserts Close returns promptly (no deadlock) and leaks no goroutines. This is the
+// production early-exit path (instant queries, LIMIT, client cancel).
+func TestDataObjLogReader_CloseBeforeDrain(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	ctx := user.InjectOrgID(context.Background(), dataObjTestTenant)
+	at := func(sec int64) time.Time { return time.Unix(sec, 0) }
+
+	objStreams := make([]logproto.Stream, 0, 32)
+	for i := 0; i < 32; i++ {
+		app := fmt.Sprintf("app-%02d", i)
+		objStreams = append(objStreams, logproto.Stream{
+			Labels:  labels.FromStrings("job", "t", "app", app).String(),
+			Entries: []push.Entry{{Timestamp: at(int64(i + 1)), Line: app}},
+		})
+	}
+	bucket := objstore.NewInMemBucket()
+	ms := newTestDataObjMetastore(ctx, t, bucket, 1, [][]logproto.Stream{objStreams}) // one section per stream
+
+	cache := newDataObjCache(bucket, dataObjTestTenant)
+	expr, err := syntax.ParseSampleExpr(`count_over_time({job="t"}[1h])`)
+	require.NoError(t, err)
+	matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "job", "t")}
+	tasks := newDataObjReadPlanner(ms, cache).plan(ctx, at(0), at(100), matchers, nil, expr)
+	// maxConcurrency=1, batchSize=1: after the consumer reads one record and stops, the running scan
+	// blocks on the batch channel, so Close must cancel it to unwind.
+	reader := newDataObjAbortReader(newDataObjLogReader(ctx, cache, tasks, 1, 1), tasks)
+
+	require.True(t, reader.Next(), "the reader yields at least one record")
+
+	closed := make(chan error, 1)
+	go func() { closed <- reader.Close() }()
+	select {
+	case <-closed:
+	case <-time.After(30 * time.Second):
+		t.Fatal("Close did not return; a reader or planner goroutine is stuck")
+	}
+}
+
+// TestDataObjLogReader_ResolutionErrorStopsPlanner drives a live planner over the real metastore whose
+// resolved object was deleted from the bucket, so opening it fails. It asserts the error surfaces through
+// the reader and that the planner goroutine does not leak (the abort reader stops it).
+func TestDataObjLogReader_ResolutionErrorStopsPlanner(t *testing.T) {
+	defer goleak.VerifyNone(t, goleak.IgnoreCurrent())
+	ctx := user.InjectOrgID(context.Background(), dataObjTestTenant)
+	a := labels.FromStrings("app", "a")
+	at := func(sec int64) time.Time { return time.Unix(sec, 0) }
+
+	bucket := objstore.NewInMemBucket()
+	ms := newTestDataObjMetastore(ctx, t, bucket, testSectionSize, [][]logproto.Stream{{
+		{Labels: a.String(), Entries: []push.Entry{{Timestamp: at(1), Line: "a1"}}},
+	}})
+
+	matchers := []*labels.Matcher{labels.MustNewMatcher(labels.MatchEqual, "app", "a")}
+	resp, err := ms.Sections(ctx, metastore.SectionsRequest{Start: at(0), End: at(100), Matchers: matchers})
+	require.NoError(t, err)
+	require.NotEmpty(t, resp.Sections)
+
+	// Delete the resolved data object; its index (which the metastore reads) is untouched, so resolution
+	// starts and then fails opening the object while the planner goroutine is live.
+	for _, sec := range resp.Sections {
+		require.NoError(t, bucket.Delete(ctx, sec.ObjectPath))
+	}
+
+	cache := newDataObjCache(bucket, dataObjTestTenant)
+	expr, err := syntax.ParseSampleExpr(`count_over_time({app="a"}[1h])`)
+	require.NoError(t, err)
+	tasks := newDataObjReadPlanner(ms, cache).plan(ctx, at(0), at(100), matchers, nil, expr)
+	reader := newDataObjAbortReader(newDataObjLogReader(ctx, cache, tasks, 1, defaultReadBatchSize), tasks)
+
+	var n int
+	for reader.Next() {
+		n++
+	}
+	require.Zero(t, n, "no records when the object cannot be opened")
+	require.Error(t, reader.Err(), "the deleted object must surface as a resolution error")
+	_ = reader.Close() // returns the resolution error asserted above
+}
+
+// TestDataObjLogReader_EmptyResult drives a plan that yields no tasks and no error, asserting the reader
+// yields nothing, reports no error, and closes cleanly — the path that replaced the removed
+// NoopSampleIterator special case for a query that matches no sections.
+func TestDataObjLogReader_EmptyResult(t *testing.T) {
+	it := newSliceTaskIterator(nil)
+	reader := newDataObjAbortReader(newDataObjLogReader(context.Background(), newDataObjCache(objstore.NewInMemBucket(), dataObjTestTenant), it, 1, 1), it)
+
+	var n int
+	for reader.Next() {
+		n++
+	}
+	require.Zero(t, n, "an empty plan yields no records")
+	require.NoError(t, reader.Err())
+	require.NoError(t, reader.Close())
 }

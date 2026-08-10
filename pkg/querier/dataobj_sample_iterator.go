@@ -28,7 +28,7 @@ type outSample struct {
 // objects are internally deduplicated. This is what lets the reader skip the message column for
 // count/rate.
 type dataObjSampleIterator struct {
-	reader     *dataObjLogReader
+	reader     dataObjRecordReader
 	extractors []syntax.SampleExtractor
 
 	// streamExtractors caches per-stream extractors by fingerprint, since records from different
@@ -40,7 +40,7 @@ type dataObjSampleIterator struct {
 	currPos     int
 }
 
-func newDataObjSampleIterator(reader *dataObjLogReader, extractors []syntax.SampleExtractor) *dataObjSampleIterator {
+func newDataObjSampleIterator(reader dataObjRecordReader, extractors []syntax.SampleExtractor) *dataObjSampleIterator {
 	return &dataObjSampleIterator{
 		reader:           reader,
 		extractors:       extractors,

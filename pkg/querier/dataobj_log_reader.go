@@ -62,7 +62,10 @@ type dataObjLogReader struct {
 	currPos   int
 }
 
-func newDataObjLogReader(ctx context.Context, cache *dataObjCache, tasks []dataObjReadTask, maxConcurrency, batchSize int) *dataObjLogReader {
+// newDataObjLogReader starts scanning the tasks the iterator streams. It owns a cancellable context for
+// its scans and cancels it on Close. It is a pure consumer of the iterator: stopping the background
+// planner that feeds it is the caller's job (see dataObjAbortReader).
+func newDataObjLogReader(ctx context.Context, cache *dataObjCache, tasks *dataObjTaskIterator, maxConcurrency, batchSize int) *dataObjLogReader {
 	if maxConcurrency < 1 {
 		maxConcurrency = 1
 	}
@@ -82,25 +85,34 @@ func newDataObjLogReader(ctx context.Context, cache *dataObjCache, tasks []dataO
 	return r
 }
 
-func (r *dataObjLogReader) runTasks(ctx context.Context, tasks []dataObjReadTask, maxConcurrency, batchSize int) {
+func (r *dataObjLogReader) runTasks(ctx context.Context, tasks *dataObjTaskIterator, maxConcurrency, batchSize int) {
 	defer close(r.stopped)
 	defer close(r.nextBatches)
 
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(maxConcurrency)
-	for _, task := range tasks {
+	for tasks.Next() {
+		if ctx.Err() != nil {
+			break // a scan failed or Close cancelled the scans; stop pulling tasks the planner may buffer
+		}
+		task := tasks.At()
 		g.Go(func() error {
 			err := r.runTask(ctx, task, batchSize)
 			if err != nil {
-				// Record the error the moment a scan fails, so Next can stop without draining the
-				// batches queued before the failure. Returning it cancels the group context, which
-				// unblocks the other scans' pending sends.
+				// Record the error the moment a scan fails, so Next can stop without draining the batches
+				// queued before it. The errgroup then cancels the sibling scans.
 				r.setErr(err)
 			}
 			return err
 		})
 	}
 	_ = g.Wait() // Errors are recorded above; wait only so the channel closes after every scan stops.
+
+	// A resolution failure (metastore lookup or object streams read) is surfaced the same way as a scan
+	// error, so the query fails rather than silently returning the tasks planned before it.
+	if err := tasks.Err(); err != nil {
+		r.setErr(err)
+	}
 }
 
 func (r *dataObjLogReader) runTask(ctx context.Context, task dataObjReadTask, batchSize int) error {
@@ -199,4 +211,45 @@ func (r *dataObjLogReader) Close() error {
 	<-r.stopped
 	r.cache.Close()
 	return r.Err()
+}
+
+// dataObjRecordReader yields decoded log records. Both dataObjLogReader and dataObjAbortReader implement
+// it, so the sample iterator can consume either.
+type dataObjRecordReader interface {
+	Next() bool
+	At() dataObjLogRecord
+	Err() error
+	Close() error
+}
+
+// dataObjAbortReader wraps a dataObjLogReader and stops the background planner (through the task
+// iterator's Abort) once reading finishes — on a terminal error or on Close — so the planner never
+// outlives the read it feeds. The wrapped reader stays a pure consumer with no knowledge of the planner.
+type dataObjAbortReader struct {
+	*dataObjLogReader
+	tasks *dataObjTaskIterator
+}
+
+func newDataObjAbortReader(reader *dataObjLogReader, tasks *dataObjTaskIterator) *dataObjAbortReader {
+	return &dataObjAbortReader{dataObjLogReader: reader, tasks: tasks}
+}
+
+// Next forwards to the wrapped reader. When the reader stops on an error, it aborts the planner so it
+// does not keep resolving objects for a query that has already failed.
+func (r *dataObjAbortReader) Next() bool {
+	ok := r.dataObjLogReader.Next()
+	if !ok {
+		if err := r.dataObjLogReader.Err(); err != nil {
+			r.tasks.Abort(err)
+		}
+	}
+	return ok
+}
+
+// Close aborts the planner first — Abort waits for it to stop using the cache — then closes the wrapped
+// reader, which waits for the scans and releases the cache. So the cache is released only after both let
+// go.
+func (r *dataObjAbortReader) Close() error {
+	r.tasks.Abort(nil)
+	return r.dataObjLogReader.Close()
 }
