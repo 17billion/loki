@@ -202,6 +202,14 @@ type evalCmd struct {
 	query            string
 }
 
+// getTimeRange returns the query's [start, end] range and step.
+func (c evalCmd) getTimeRange() (start, end, step time.Duration) {
+	if c.instant {
+		return c.ts, c.ts, 0
+	}
+	return c.start, c.end, c.step
+}
+
 func parseEval(line string) (evalCmd, error) {
 	rest := strings.TrimSpace(strings.TrimPrefix(line, "eval"))
 	switch {

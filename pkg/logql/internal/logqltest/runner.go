@@ -1,21 +1,14 @@
 package logqltest
 
 import (
-	"context"
 	"fmt"
 	"math"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/go-kit/log"
-	"github.com/grafana/dskit/flagext"
-	"github.com/grafana/dskit/user"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/v3/pkg/logproto"
-	"github.com/grafana/loki/v3/pkg/logql"
 	"github.com/grafana/loki/v3/pkg/logqlmodel"
 )
 
@@ -32,39 +25,32 @@ const (
 // expected results, in a DSL documented in README.md. Loaded streams are encoded into a real
 // chunk store and each query runs through the production storage read path + logql.Engine, so
 // the full chunk-decode/parsing/extraction pipeline is exercised end-to-end.
+//
+// Every query runs on three execution stacks: the direct querier, and a real query-frontend +
+// query-scheduler + querier loop with sharding off and on.
 func RunScript(t *testing.T, name, script string) {
 	t.Helper()
 
-	var (
-		store          *testingChunkStore
-		querier        logql.Querier
-		streams        = newStreamsParser()
-		streamsChanged = true
-	)
+	streams := newStreamsParser()
+	streamsChanged := true
 
-	// The loaded streams are materialised into a real chunk store, rebuilt whenever the data
-	// changes (after load/clear) and reused across the evals that query it.
-	defer func() {
-		if store != nil {
-			store.close()
-		}
-	}()
-	getQuerier := func() logql.Querier {
+	// Each stack owns everything it needs to run a query, including its store.
+	directStack := newDirectStack(t)
+	frontendWithoutShardingStack, err := newQueryFrontendStack(t, false)
+	require.NoErrorf(t, err, "%s: build query-frontend stack (sharded=false)", name)
+	frontendWithSharding, err := newQueryFrontendStack(t, true)
+	require.NoErrorf(t, err, "%s: build query-frontend stack (sharded=true)", name)
+	stacks := []executionStack{directStack, frontendWithoutShardingStack, frontendWithSharding}
+
+	// refreshStreams gives every stack the current data before an eval.
+	refreshStreams := func() {
 		if !streamsChanged {
-			return querier
+			return
 		}
-
-		if store != nil {
-			store.close()
+		for _, s := range stacks {
+			s.setStreams(streams.get())
 		}
-
-		store = newTestingChunkStore(t)
-		store.write(t, streams.get())
-		store.flush(t)
-		querier = store.querier()
 		streamsChanged = false
-
-		return querier
 	}
 
 	lines := strings.Split(script, "\n")
@@ -106,14 +92,17 @@ func RunScript(t *testing.T, name, script string) {
 			if err := exp.validate(); err != nil {
 				t.Fatalf("%s: eval %q: %v", name, cmd.query, err)
 			}
-			runEval(t, name, getQuerier(), cmd, exp)
+			refreshStreams()
+			runEval(t, name, stacks, cmd, exp)
 		default:
 			t.Fatalf("%s: unexpected command %q", name, fields[0])
 		}
 	}
 }
 
-func runEval(t *testing.T, name string, querier logql.Querier, cmd evalCmd, exp expectations) {
+// runEval runs cmd on each execution stack as its own subtest. A stack that does not support the
+// query skips its subtest (visible in the output) instead of being omitted.
+func runEval(t *testing.T, name string, stacks []executionStack, cmd evalCmd, exp expectations) {
 	t.Helper()
 	label := cmd.query
 	if cmd.instant {
@@ -123,46 +112,43 @@ func runEval(t *testing.T, name string, querier logql.Querier, cmd evalCmd, exp 
 	}
 
 	t.Run(label, func(t *testing.T) {
-		// Run query engine with the default config.
-		var opts logql.EngineOpts
-		flagext.DefaultValues(&opts)
-		engine := logql.NewEngine(opts, querier, logql.NoLimits, log.NewNopLogger())
-
-		var start, end, step time.Duration
-		if cmd.instant {
-			start, end, step = cmd.ts, cmd.ts, 0
-		} else {
-			start, end, step = cmd.start, cmd.end, cmd.step
+		for _, stack := range stacks {
+			t.Run(stack.name(), func(t *testing.T) {
+				if !stack.isEvalSupported(cmd, exp) {
+					t.Skipf("%s: stack does not support this query", stack.name())
+				}
+				res, err := stack.eval(cmd)
+				assertResult(t, name, cmd, exp, res, err, stack.isQueryShardingSupported())
+			})
 		}
-
-		ctx := user.InjectOrgID(context.Background(), tenant)
-
-		// Build the params and execute. A failure can surface at either step (parse-time
-		// errors come from NewLiteralParams, evaluation errors from Exec).
-		var res logqlmodel.Result
-		params, err := logql.NewLiteralParams(
-			cmd.query,
-			epoch.Add(start), epoch.Add(end), step, 0,
-			logproto.FORWARD, 1000, nil, nil,
-		)
-		if err == nil {
-			res, err = engine.Query(params).Exec(ctx)
-		}
-
-		if exp.fail {
-			require.Errorf(t, err, "%s: expected query %q to fail", name, cmd.query)
-			switch exp.failKind {
-			case failMsg:
-				require.Contains(t, err.Error(), exp.failText, "%s: failure message", name)
-			case failRegex:
-				require.Regexp(t, exp.failText, err.Error(), "%s: failure regex", name)
-			}
-			return
-		}
-
-		require.NoError(t, err, "%s: query %q", name, cmd.query)
-		require.NoError(t, compareResult(name, cmd, exp, res.Data))
 	})
+}
+
+// assertResult applies exp to a result any execution stack produces. On a fail expectation it
+// checks the error; otherwise it compares the data and, for a sharding stack running a shardable
+// query, asserts the response reported at least two shards.
+func assertResult(t *testing.T, name string, cmd evalCmd, exp expectations, res logqlmodel.Result, err error, queryShardingEnabled bool) {
+	t.Helper()
+
+	if exp.fail {
+		require.Errorf(t, err, "%s: expected query %q to fail", name, cmd.query)
+		switch exp.failKind {
+		case failMsg:
+			require.Contains(t, err.Error(), exp.failText, "%s: failure message", name)
+		case failRegex:
+			require.Regexp(t, exp.failText, err.Error(), "%s: failure regex", name)
+		}
+		return
+	}
+
+	require.NoError(t, err, "%s: query %q", name, cmd.query)
+	require.NoError(t, compareResult(name, cmd, exp, res.Data))
+
+	if queryShardingEnabled && isQueryShardingSupported(cmd.query) {
+		require.GreaterOrEqualf(t, res.Statistics.Summary.Shards, int64(2),
+			"%s: query %q expected to shard (>=2 shards), got %d; list its op in isQueryShardingSupported if it legitimately does not shard",
+			name, cmd.query, res.Statistics.Summary.Shards)
+	}
 }
 
 // parseLoadBlock consumes a load command's indented data lines into p, returning the index of the
