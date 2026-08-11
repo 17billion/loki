@@ -1,6 +1,7 @@
 package logqltest
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
@@ -93,7 +94,7 @@ eval instant at 60s sum by (app,machine) (count_over_time({app="foo"}[1m])) > bo
 func TestComparators_DetectMismatches(t *testing.T) {
 	foo := labels.FromStrings("app", "a")
 	rangeCmd := evalCmd{start: time.Minute, end: time.Minute, step: time.Minute}
-	instantCmd := evalCmd{instant: true}
+	instantCmd := evalCmd{instant: true, ts: time.Minute}
 	ts := epoch.Add(time.Minute).UnixMilli()
 	scalar := func(v float64) expectations { return expectations{scalar: &v} }
 
@@ -106,27 +107,27 @@ func TestComparators_DetectMismatches(t *testing.T) {
 			want: "scalar mismatch: want 5, got 6",
 		},
 		"vector value": {
-			err:  compareVector("n", instantCmd, oneSeries(5), promql.Vector{{Metric: foo, F: 6}}),
+			err:  compareVector("n", instantCmd, oneSeries(5), promql.Vector{{Metric: foo, F: 6, T: ts}}),
 			want: `series {app="a"} value mismatch: want 5, got 6`,
 		},
 		"vector wrong timestamp": {
 			err:  compareVector("n", instantCmd, oneSeries(5), promql.Vector{{Metric: foo, F: 5, T: 1000}}),
-			want: `series {app="a"} has timestamp 1000ms, expected 0ms`,
+			want: fmt.Sprintf(`series {app="a"} has timestamp 1000ms, expected %dms`, ts),
 		},
 		"vector ordered wrong timestamp": {
 			err:  compareVector("n", instantCmd, expectations{ordered: true, series: []expectedSeries{{labels: `{app="a"}`, samples: []sample{{present: true, value: 5}}}}}, promql.Vector{{Metric: foo, F: 5, T: 1000}}),
-			want: `series {app="a"} has timestamp 1000ms, expected 0ms`,
+			want: fmt.Sprintf(`series {app="a"} has timestamp 1000ms, expected %dms`, ts),
 		},
 		"vector missing series": {
 			err:  compareVector("n", instantCmd, oneSeries(5), promql.Vector{}),
 			want: `series count mismatch: want map[{app="a"}:5], got map[]`,
 		},
 		"vector extra series": {
-			err:  compareVector("n", instantCmd, oneSeries(5), promql.Vector{{Metric: foo, F: 5}, {Metric: labels.FromStrings("app", "b"), F: 9}}),
+			err:  compareVector("n", instantCmd, oneSeries(5), promql.Vector{{Metric: foo, F: 5, T: ts}, {Metric: labels.FromStrings("app", "b"), F: 9, T: ts}}),
 			want: `series count mismatch: want map[{app="a"}:5], got map[{app="a"}:5 {app="b"}:9]`,
 		},
 		"vector duplicate result series": {
-			err:  compareVector("n", instantCmd, oneSeries(5), promql.Vector{{Metric: foo, F: 5}, {Metric: foo, F: 5}}),
+			err:  compareVector("n", instantCmd, oneSeries(5), promql.Vector{{Metric: foo, F: 5, T: ts}, {Metric: foo, F: 5, T: ts}}),
 			want: `engine returned duplicate series {app="a"}`,
 		},
 		"matrix value": {
@@ -177,7 +178,7 @@ func TestComparators_DetectMismatches(t *testing.T) {
 			want: "scalar result but no scalar value expected",
 		},
 		"vector missing series (count matches)": {
-			err:  compareVector("n", instantCmd, oneSeries(5), promql.Vector{{Metric: labels.FromStrings("app", "b"), F: 5}}),
+			err:  compareVector("n", instantCmd, oneSeries(5), promql.Vector{{Metric: labels.FromStrings("app", "b"), F: 5, T: ts}}),
 			want: `missing expected series {app="a"}`,
 		},
 		"matrix missing series (count matches)": {
@@ -201,7 +202,7 @@ func TestComparators_DetectMismatches(t *testing.T) {
 			want: `duplicate expected series {app="a"}`,
 		},
 		"ordered value mismatch": {
-			err:  compareVector("n", instantCmd, expectations{ordered: true, series: []expectedSeries{{labels: `{app="a"}`, samples: []sample{{present: true, value: 5}}}}}, promql.Vector{{Metric: foo, F: 6}}),
+			err:  compareVector("n", instantCmd, expectations{ordered: true, series: []expectedSeries{{labels: `{app="a"}`, samples: []sample{{present: true, value: 5}}}}}, promql.Vector{{Metric: foo, F: 6, T: ts}}),
 			want: `series {app="a"} (position 0) value mismatch: want 5, got 6`,
 		},
 		"ordered count mismatch": {
@@ -234,11 +235,11 @@ func TestComparators_AcceptMatches(t *testing.T) {
 	foo := labels.FromStrings("app", "a")
 	scalar := 5.0
 	rangeCmd := evalCmd{start: time.Minute, end: time.Minute, step: time.Minute}
-	instantCmd := evalCmd{instant: true}
+	instantCmd := evalCmd{instant: true, ts: time.Minute}
 	ts := epoch.Add(time.Minute).UnixMilli()
 
 	require.NoError(t, compareScalar("n", expectations{scalar: &scalar}, promql.Scalar{V: 5}))
-	require.NoError(t, compareVector("n", instantCmd, oneSeries(5), promql.Vector{{Metric: foo, F: 5}}))
+	require.NoError(t, compareVector("n", instantCmd, oneSeries(5), promql.Vector{{Metric: foo, F: 5, T: ts}}))
 	require.NoError(t, compareMatrix("n", rangeCmd, oneSeries(5), promql.Matrix{{Metric: foo, Floats: []promql.FPoint{{T: ts, F: 5}}}}))
 	require.NoError(t, compareResult("n", evalCmd{instant: true, ts: time.Minute}, expectations{empty: true}, promql.Vector{}))
 
@@ -254,7 +255,7 @@ func TestComparators_AcceptMatches(t *testing.T) {
 			{labels: `{app="a"}`, samples: []sample{{present: true, value: 1}}},
 			{labels: `{app="b"}`, samples: []sample{{present: true, value: 2}}},
 		}},
-		promql.Vector{{Metric: foo, F: 1}, {Metric: labels.FromStrings("app", "b"), F: 2}}))
+		promql.Vector{{Metric: foo, F: 1, T: ts}, {Metric: labels.FromStrings("app", "b"), F: 2, T: ts}}))
 }
 
 func TestFloatsEqual(t *testing.T) {
