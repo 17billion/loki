@@ -517,27 +517,16 @@ func (m ShardMapper) mapRangeAggregationExpr(expr *syntax.RangeAggregationExpr, 
 			return nil, 0, err
 		}
 
-		// Strip unwrap from log range
-		countOverTimeSelector, err := expr.Left.WithoutUnwrap()
-		if err != nil {
-			return nil, 0, err
-		}
-
-		// labelSampleExtractor includes the unwrap identifier in without() list if no grouping is specified
-		// similar change is required for the RHS here to ensure the resulting label sets match
-		rhsGrouping := *grouping
-		if rhsGrouping.Without {
-			if expr.Left.Unwrap != nil {
-				rhsGrouping.Groups = append(rhsGrouping.Groups, expr.Left.Unwrap.Identifier)
-			}
-		}
-
+		// Keep the unwrap on the count leg so the denominator counts extracted samples, not log
+		// lines. Stripping it makes count_over_time count every line in the window, including
+		// lines that carry no (or a non-numeric) unwrapped value, which the numerator's
+		// sum_over_time skips — yielding a too-large denominator and a too-small average.
 		rhs, rhsBytesPerShard, err := m.mapVectorAggregationExpr(&syntax.VectorAggregationExpr{
 			Left: &syntax.RangeAggregationExpr{
-				Left:      countOverTimeSelector,
+				Left:      expr.Left,
 				Operation: syntax.OpRangeTypeCount,
 			},
-			Grouping:  &rhsGrouping,
+			Grouping:  grouping,
 			Operation: syntax.OpTypeSum,
 		}, r, false)
 		if err != nil {
