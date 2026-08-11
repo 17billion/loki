@@ -19,7 +19,11 @@ import (
 
 // epoch is the base time the script's relative timestamps are added to. Timestamps in a
 // script (`@ 10s`, `eval instant at 60s`) are durations offset from this base.
-var epoch = time.Unix(0, 0).UTC()
+//
+// A realistic base, not Unix(0,0): the query-range HTTP codec sends times as integer nanoseconds,
+// and loghttp.parseTimestamp reads any value with 10 or fewer digits as seconds. Times near
+// Unix(0,0) have <= 10 digits and are misread as seconds; a 2026 base keeps them at 19 digits.
+var epoch = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 
 var (
 	// reInstant and reRange match the remainder of an `eval instant`/`eval range` line (after the
