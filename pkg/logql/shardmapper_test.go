@@ -394,9 +394,9 @@ func TestMappingStrings(t *testing.T) {
 				)
 				/
 				sum by (cluster) (
-					downstream<sum by (cluster) (count_over_time({job=~"myapps.*"}|="stats" | json busy="utilization" | unwrap busy [5m])),shard=0_of_2>
+					downstream<sum by (cluster) (count_over_time({job=~"myapps.*"}|="stats" | json busy="utilization" [5m])),shard=0_of_2>
 					++
-					downstream<sum by (cluster) (count_over_time({job=~"myapps.*"}|="stats" | json busy="utilization" | unwrap busy [5m])),shard=1_of_2>
+					downstream<sum by (cluster) (count_over_time({job=~"myapps.*"}|="stats" | json busy="utilization" [5m])),shard=1_of_2>
 				)
 			)`,
 		},
@@ -409,10 +409,10 @@ func TestMappingStrings(t *testing.T) {
 					downstream<sum without() (sum_over_time({job=~"myapps.*"} |="stats" | json | keep busy | unwrap busy [5m])),shard=1_of_2>
 				)
 				/
-				sum without() (
-					downstream<sum without() (count_over_time({job=~"myapps.*"} |="stats" | json | keep busy | unwrap busy [5m])),shard=0_of_2>
+				sum without(busy) (
+					downstream<sum without(busy) (count_over_time({job=~"myapps.*"} |="stats" | json | keep busy [5m])),shard=0_of_2>
 					++
-					downstream<sum without() (count_over_time({job=~"myapps.*"} |="stats" | json | keep busy | unwrap busy [5m])),shard=1_of_2>
+					downstream<sum without(busy) (count_over_time({job=~"myapps.*"} |="stats" | json | keep busy [5m])),shard=1_of_2>
 				)
 			)`,
 		},
@@ -425,10 +425,10 @@ func TestMappingStrings(t *testing.T) {
 					downstream<sum without(foo) (sum_over_time({job=~"myapps.*"} |="stats" | json | keep busy | unwrap busy [5m])),shard=1_of_2>
 				)
 				/
-				sum without(foo) (
-					downstream<sum without(foo) (count_over_time({job=~"myapps.*"} |="stats" | json | keep busy | unwrap busy [5m])),shard=0_of_2>
+				sum without(foo,busy) (
+					downstream<sum without(foo,busy) (count_over_time({job=~"myapps.*"} |="stats" | json | keep busy [5m])),shard=0_of_2>
 					++
-					downstream<sum without(foo) (count_over_time({job=~"myapps.*"} |="stats" | json | keep busy | unwrap busy [5m])),shard=1_of_2>
+					downstream<sum without(foo,busy) (count_over_time({job=~"myapps.*"} |="stats" | json | keep busy [5m])),shard=1_of_2>
 				)
 			)`,
 		},
@@ -506,10 +506,10 @@ func TestMappingStrings(t *testing.T) {
 						downstream<sum without () (sum_over_time({foo="bar"} | logfmt | drop level | unwrap bar [5m])), shard=1_of_2>
 					)
 					/
-					sum without () (
-						downstream<sum without () (count_over_time({foo="bar"} | logfmt | drop level | unwrap bar [5m])), shard=0_of_2>
+					sum without (bar) (
+						downstream<sum without (bar) (count_over_time({foo="bar"} | logfmt | drop level [5m])), shard=0_of_2>
 						++
-						downstream<sum without () (count_over_time({foo="bar"} | logfmt | drop level | unwrap bar [5m])), shard=1_of_2>
+						downstream<sum without (bar) (count_over_time({foo="bar"} | logfmt | drop level [5m])), shard=1_of_2>
 					)
 				)
 			)`,
@@ -1686,9 +1686,6 @@ func TestMapping(t *testing.T) {
 											Mts: []*labels.Matcher{mustNewMatcher(labels.MatchEqual, "foo", "bar")},
 										},
 										Interval: 5 * time.Minute,
-										Unwrap: &syntax.UnwrapExpr{
-											Identifier: "bytes",
-										},
 									},
 								},
 							},
@@ -1711,9 +1708,6 @@ func TestMapping(t *testing.T) {
 												Mts: []*labels.Matcher{mustNewMatcher(labels.MatchEqual, "foo", "bar")},
 											},
 											Interval: 5 * time.Minute,
-											Unwrap: &syntax.UnwrapExpr{
-												Identifier: "bytes",
-											},
 										},
 									},
 								},

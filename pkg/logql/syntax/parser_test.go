@@ -1667,20 +1667,9 @@ var ParseTestCases = []struct {
 		err: logqlmodel.NewParseError("invalid aggregation sum_over_time without unwrap", 0, 0),
 	},
 	{
-		in: `count_over_time({app="foo"} |= "foo" | json | unwrap foo [5m])`,
-		exp: newRangeAggregationExpr(
-			newLogRange(&PipelineExpr{
-				Left: newMatcherExpr([]*labels.Matcher{{Type: labels.MatchEqual, Name: "app", Value: "foo"}}),
-				MultiStages: MultiStageExpr{
-					newLineFilterExpr(log.LineMatchEqual, "", "foo"),
-					newLabelParserExpr(OpParserTypeJSON, ""),
-				},
-			},
-				5*time.Minute,
-				newUnwrapExpr("foo", ""),
-				nil),
-			OpRangeTypeCount, nil, nil,
-		),
+		in:  `count_over_time({app="foo"} |= "foo" | json | unwrap foo [5m])`,
+		exp: nil,
+		err: logqlmodel.NewParseError("invalid aggregation count_over_time with unwrap", 0, 0),
 	},
 	{
 		in: `{app="foo"} |= "bar" | json |  status_code < 500 or status_code > 200 and size >= 2.5KiB `,

@@ -1415,7 +1415,7 @@ func (e RangeAggregationExpr) validate() error {
 	}
 	if e.Left.Unwrap != nil {
 		switch e.Operation {
-		case OpRangeTypeAvg, OpRangeTypeSum, OpRangeTypeCount, OpRangeTypeMax, OpRangeTypeMin, OpRangeTypeStddev,
+		case OpRangeTypeAvg, OpRangeTypeSum, OpRangeTypeMax, OpRangeTypeMin, OpRangeTypeStddev,
 			OpRangeTypeStdvar, OpRangeTypeQuantile, OpRangeTypeRate, OpRangeTypeRateCounter,
 			OpRangeTypeAbsent, OpRangeTypeFirst, OpRangeTypeLast, OpRangeTypeQuantileSketch,
 			OpRangeTypeFirstWithTimestamp, OpRangeTypeLastWithTimestamp:
